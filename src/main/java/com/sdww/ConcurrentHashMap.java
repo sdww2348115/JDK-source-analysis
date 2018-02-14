@@ -97,4 +97,91 @@ public class ConcurrentHashMap {
         addCount(1L, binCount);
         return null;
     }
+
+    /**
+     * 将链表转化为红黑树的关键函数
+     * @param tab
+     * @param index
+     */
+    private final void treeifyBin(Node<K,V>[] tab, int index) {
+        Node<K,V> b; int n, sc;
+        if (tab != null) {
+            //首先判断table大小，如果table太小的话先尝试通过扩容table的方式减少冲突
+            if ((n = tab.length) < MIN_TREEIFY_CAPACITY)
+                tryPresize(n << 1);
+            //核心转换函数
+            else if ((b = tabAt(tab, index)) != null && b.hash >= 0) {
+                synchronized (b) {
+                    if (tabAt(tab, index) == b) {
+                        TreeNode<K,V> hd = null, tl = null;
+                        for (Node<K,V> e = b; e != null; e = e.next) {
+                            TreeNode<K,V> p =
+                                    new TreeNode<K,V>(e.hash, e.key, e.val,
+                                            null, null);
+                            if ((p.prev = tl) == null)
+                                hd = p;
+                            else
+                                tl.next = p;
+                            tl = p;
+                        }
+                        //插入/转换等步骤实际执行函数
+                        setTabAt(tab, index, new TreeBin<K,V>(hd));
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * 构建红黑树
+     * @param b
+     */
+    TreeBin(TreeNode<K,V> b) {
+        //TREEBIN为-2，代表该bin为一个TreeBin
+        super(TREEBIN, null, null, null);
+        this.first = b;
+        TreeNode<K,V> r = null;
+        //初始化所有的TreeNode，此时所有的TreeNode以链表的形式组织在一起，通过next指针连接
+        for (TreeNode<K,V> x = b, next; x != null; x = next) {
+            next = (TreeNode<K,V>)x.next;
+            x.left = x.right = null;
+            //初始化首节点
+            if (r == null) {
+                x.parent = null;
+                x.red = false;
+                r = x;
+            }
+            else {
+                K k = x.key;
+                int h = x.hash;
+                Class<?> kc = null;
+                for (TreeNode<K,V> p = r;;) {
+                    int dir, ph;
+                    K pk = p.key;
+                    if ((ph = p.hash) > h)
+                        dir = -1;
+                    else if (ph < h)
+                        dir = 1;
+                    //无法比较大小或者hash值相等的情况，使用额外方式进行比较
+                    else if ((kc == null &&
+                            (kc = comparableClassFor(k)) == null) ||
+                            (dir = compareComparables(kc, k, pk)) == 0)
+                        dir = tieBreakOrder(k, pk);
+                    //红黑树的具体插入实现
+                    TreeNode<K,V> xp = p;
+                    if ((p = (dir <= 0) ? p.left : p.right) == null) {
+                        x.parent = xp;
+                        if (dir <= 0)
+                            xp.left = x;
+                        else
+                            xp.right = x;
+                        r = balanceInsertion(r, x);
+                        break;
+                    }
+                }
+            }
+        }
+        this.root = r;
+        assert checkInvariants(root);
+    }
 }
