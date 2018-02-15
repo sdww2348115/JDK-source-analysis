@@ -184,4 +184,166 @@ public class ConcurrentHashMap {
         this.root = r;
         assert checkInvariants(root);
     }
+
+    /**
+     * 更新concurrentHashMap的count值
+     * @param x
+     * @param check
+     */
+    private final void addCount(long x, int check) {
+        CounterCell[] as; long b, s;
+        if ((as = counterCells) != null ||
+                //原子更新baseCount失败
+                !U.compareAndSwapLong(this, BASECOUNT, b = baseCount, s = b + x)) {
+            CounterCell a; long v; int m;
+            boolean uncontended = true;
+            if (as == null || (m = as.length - 1) < 0 ||
+                    (a = as[ThreadLocalRandom.getProbe() & m]) == null ||
+                    //首先尝试原子更新CountCell中的值
+                    !(uncontended =
+                            U.compareAndSwapLong(a, CELLVALUE, v = a.value, v + x))) {
+                //往as中添加新的CounterCell，且添加失败
+                fullAddCount(x, uncontended);
+                return;
+            }
+            if (check <= 1)
+                return;
+            s = sumCount();
+        }
+        if (check >= 0) {
+            Node<K,V>[] tab, nt; int n, sc;
+            while (s >= (long)(sc = sizeCtl) && (tab = table) != null &&
+                    (n = tab.length) < MAXIMUM_CAPACITY) {
+                int rs = resizeStamp(n);
+                if (sc < 0) {
+                    if ((sc >>> RESIZE_STAMP_SHIFT) != rs || sc == rs + 1 ||
+                            sc == rs + MAX_RESIZERS || (nt = nextTable) == null ||
+                            transferIndex <= 0)
+                        break;
+                    if (U.compareAndSwapInt(this, SIZECTL, sc, sc + 1))
+                        transfer(tab, nt);
+                }
+                else if (U.compareAndSwapInt(this, SIZECTL, sc,
+                        (rs << RESIZE_STAMP_SHIFT) + 2))
+                    transfer(tab, null);
+                s = sumCount();
+            }
+        }
+    }
+
+    /**
+     * 添加count值
+     * @param x
+     * @param wasUncontended
+     */
+    private final void fullAddCount(long x, boolean wasUncontended) {
+        //随机初始化一个int值，设置其为h
+        int h;
+        if ((h = ThreadLocalRandom.getProbe()) == 0) {
+            ThreadLocalRandom.localInit();      // force initialization
+            h = ThreadLocalRandom.getProbe();
+            wasUncontended = true;
+        }
+        boolean collide = false;                // True if last slot nonempty
+        for (;;) {
+            CounterCell[] as; CounterCell a; int n; long v;
+            if ((as = counterCells) != null && (n = as.length) > 0) {
+                //随机位置的countCell为空
+                if ((a = as[(n - 1) & h]) == null) {
+                    if (cellsBusy == 0) {            // Try to attach new Cell
+                        CounterCell r = new CounterCell(x); // Optimistic create
+                        if (cellsBusy == 0 &&
+                                //cas替换cellsBusy值为1，代表获取到counterCells的写锁
+                                //下方操作为将新创建的CounterCell值放入对应位置中
+                                U.compareAndSwapInt(this, CELLSBUSY, 0, 1)) {
+                            boolean created = false;
+                            try {               // Recheck under lock
+                                CounterCell[] rs; int m, j;
+                                if ((rs = counterCells) != null &&
+                                        (m = rs.length) > 0 &&
+                                        rs[j = (m - 1) & h] == null) {
+                                    rs[j] = r;
+                                    created = true;
+                                }
+                            } finally {
+                                cellsBusy = 0;
+                            }
+                            if (created)
+                                break;
+                            continue;           // Slot is now non-empty
+                        }
+                    }
+                    collide = false;
+                }
+                else if (!wasUncontended)       // CAS already known to fail
+                    wasUncontended = true;      // Continue after rehash
+                //再次尝试通过cas将值附加到对应位置的CounterCell中
+                else if (U.compareAndSwapLong(a, CELLVALUE, v = a.value, v + x))
+                    break;
+                //counterCells数组已经被更新，不再指向原来的数组了，说明经过了resize
+                else if (counterCells != as || n >= NCPU)
+                    collide = false;            // At max size or stale
+                //说明发生了碰撞，即cellsBusy为ture，且无法通过CAS将value附加到CounterCell中
+                else if (!collide)
+                    collide = true;
+                //再次尝试获取cellsBusy锁资源，扩大counterCells数组
+                //隐含含义为：当前的CounterCells冲突严重，无法正确处理统计信息，需要扩大CounterCells的个数避免冲突，提高效率
+                else if (cellsBusy == 0 &&
+                        U.compareAndSwapInt(this, CELLSBUSY, 0, 1)) {
+                    try {
+                        if (counterCells == as) {// Expand table unless stale
+                            CounterCell[] rs = new CounterCell[n << 1];
+                            for (int i = 0; i < n; ++i)
+                                rs[i] = as[i];
+                            counterCells = rs;
+                        }
+                    } finally {
+                        cellsBusy = 0;
+                    }
+                    collide = false;
+                    continue;                   // Retry with expanded table
+                }
+                h = ThreadLocalRandom.advanceProbe(h);
+            }
+            //当CounterCells数组为空，初始化CounterCells，第一次初始化CounterCells数组大小为2，每次扩展都为原大小*2
+            else if (cellsBusy == 0 && counterCells == as &&
+                    U.compareAndSwapInt(this, CELLSBUSY, 0, 1)) {
+                boolean init = false;
+                try {                           // Initialize table
+                    if (counterCells == as) {
+                        CounterCell[] rs = new CounterCell[2];
+                        rs[h & 1] = new CounterCell(x);
+                        counterCells = rs;
+                        init = true;
+                    }
+                } finally {
+                    cellsBusy = 0;
+                }
+                if (init)
+                    break;
+            }
+            //最后再尝试一下baseCount能否直接添加count值
+            else if (U.compareAndSwapLong(this, BASECOUNT, v = baseCount, v + x))
+                break;                          // Fall back on using base
+        }
+    }
+
+    /**
+     * ConcurrentHashMap通过baseCount与CounterCell数组共同记录当前map中保存的元素数量
+     * 1.首先尝试使用一个volitale值BaseCount记录元素总数
+     * 2.当baseCount冲突严重，影响吞吐时，则使用辅助数组CounterCells帮助记录元素数量
+     * 3.调用size()函数时则需要将baseCount与辅助数组所保存的值加起来则可得到最终结果。
+     * @return
+     */
+    final long sumCount() {
+        CounterCell[] as = counterCells; CounterCell a;
+        long sum = baseCount;
+        if (as != null) {
+            for (int i = 0; i < as.length; ++i) {
+                if ((a = as[i]) != null)
+                    sum += a.value;
+            }
+        }
+        return sum;
+    }
 }
