@@ -210,19 +210,31 @@ public class ConcurrentHashMap {
                 return;
             s = sumCount();
         }
+        //check代表是否检查table容量，是否需要resize
         if (check >= 0) {
             Node<K,V>[] tab, nt; int n, sc;
             while (s >= (long)(sc = sizeCtl) && (tab = table) != null &&
                     (n = tab.length) < MAXIMUM_CAPACITY) {
                 int rs = resizeStamp(n);
+                //map已经处于resize状态下，说明有其他thread正在进行transfer操作
                 if (sc < 0) {
-                    if ((sc >>> RESIZE_STAMP_SHIFT) != rs || sc == rs + 1 ||
-                            sc == rs + MAX_RESIZERS || (nt = nextTable) == null ||
-                            transferIndex <= 0)
+                    //当sc为负数时，其表示的含义为此次resize的目标(高RESIZESTAMP位)+此次resize最多容纳的并行线程数(32-RESIZESTAMP)
+                    //所以如果sc >> RESIZE_STAMP_SHIFT != rs时，说明当前resize的目标已经大于需要resize的目标了，直接退出
+                    if ((sc >>> RESIZE_STAMP_SHIFT) != rs
+                            //由于transfer时的初始值即为(rs<<RESIZE_STAMP_SHIFT) + 2,因此这里的rs+1理应不应该出现
+                            || sc == rs + 1
+                            //目前并行transfer线程已经达到最大并行线程限制
+                            || sc == rs + MAX_RESIZERS
+                            //TODO:上述两个判断的rs是否应该为rs << RESIZE_STAMP_SHIFT呢？
+                            //resize已经完成
+                            || (nt = nextTable) == null
+                            //已经没有需要transfer的bin了
+                            || transferIndex <= 0)
                         break;
                     if (U.compareAndSwapInt(this, SIZECTL, sc, sc + 1))
                         transfer(tab, nt);
                 }
+                //开始进行resize
                 else if (U.compareAndSwapInt(this, SIZECTL, sc,
                         (rs << RESIZE_STAMP_SHIFT) + 2))
                     transfer(tab, null);
