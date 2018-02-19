@@ -387,16 +387,21 @@ public class ConcurrentHashMap {
         ForwardingNode<K,V> fwd = new ForwardingNode<K,V>(nextTab);
         boolean advance = true;
         boolean finishing = false; // to ensure sweep before committing nextTab
+        //整个table将被处理为stride长度的数段，所有线程从后向前进行处理，每个线程以stride长度的task为单位进行处理
         for (int i = 0, bound = 0;;) {
             Node<K,V> f; int fh;
             while (advance) {
                 int nextIndex, nextBound;
+                //该stride段未处理完，继续进行处理
+                //整个transfer过程已经完全处理完毕，退出循环
                 if (--i >= bound || finishing)
                     advance = false;
+                //将transferIndex赋值给nextIndex，如果该值小于等于0 ，说明所有段都处理完成了
                 else if ((nextIndex = transferIndex) <= 0) {
                     i = -1;
                     advance = false;
                 }
+                //使用CAS更新transferIndex为下一个stride段的起始index
                 else if (U.compareAndSwapInt
                         (this, TRANSFERINDEX, nextIndex,
                                 nextBound = (nextIndex > stride ?
