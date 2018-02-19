@@ -408,28 +408,37 @@ public class ConcurrentHashMap {
             }
             if (i < 0 || i >= n || i + n >= nextn) {
                 int sc;
+                //transfer完成
                 if (finishing) {
                     nextTable = null;
                     table = nextTab;
                     sizeCtl = (n << 1) - (n >>> 1);
                     return;
                 }
+                //从transfer统计处线程数-1
                 if (U.compareAndSwapInt(this, SIZECTL, sc = sizeCtl, sc - 1)) {
+                    //判断transfer是否完成，是否为当前目标transfer
                     if ((sc - 2) != resizeStamp(n) << RESIZE_STAMP_SHIFT)
                         return;
                     finishing = advance = true;
                     i = n; // recheck before commit
                 }
             }
+            //将forwordNode放到原tab中第i的位置
             else if ((f = tabAt(tab, i)) == null)
                 advance = casTabAt(tab, i, null, fwd);
+            //在抢占的过程中发现第i位置的node已经被置换为forwordNode，说明其他线程已处理
             else if ((fh = f.hash) == MOVED)
                 advance = true; // already processed
             else {
+                //获得forwordNode的monitor，并将原i位置的Node中所有值移到新table中
                 synchronized (f) {
                     if (tabAt(tab, i) == f) {
                         Node<K,V> ln, hn;
                         if (fh >= 0) {
+                            //通过计算最高位是否为0确定node的位置
+                            //0 -> 新table的i位置
+                            //1 -> 新table的n + i位置
                             int runBit = fh & n;
                             Node<K,V> lastRun = f;
                             for (Node<K,V> p = f.next; p != null; p = p.next) {
@@ -464,6 +473,7 @@ public class ConcurrentHashMap {
                             TreeNode<K,V> lo = null, loTail = null;
                             TreeNode<K,V> hi = null, hiTail = null;
                             int lc = 0, hc = 0;
+                            //简单将treeNode连接起来，最后在new TreeBin处构建红黑树
                             for (Node<K,V> e = t.first; e != null; e = e.next) {
                                 int h = e.hash;
                                 TreeNode<K,V> p = new TreeNode<K,V>
@@ -485,6 +495,7 @@ public class ConcurrentHashMap {
                                     ++hc;
                                 }
                             }
+                            //由于经过了split，新table当前位置的treeNode数可能少于构建为树的阈值，对于这样的node将被重新处理为链表结构
                             ln = (lc <= UNTREEIFY_THRESHOLD) ? untreeify(lo) :
                                     (hc != 0) ? new TreeBin<K,V>(lo) : t;
                             hn = (hc <= UNTREEIFY_THRESHOLD) ? untreeify(hi) :
