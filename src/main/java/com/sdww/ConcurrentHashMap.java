@@ -185,6 +185,69 @@ public class ConcurrentHashMap {
         assert checkInvariants(root);
     }
 
+    static <K,V> TreeNode<K,V> balanceInsertion(TreeNode<K,V> root,
+                                                TreeNode<K,V> x) {
+        x.red = true;
+        for (TreeNode<K,V> xp, xpp, xppl, xppr;;) {
+            //root为null，此时x为事实上的root节点
+            if ((xp = x.parent) == null) {
+                x.red = false;
+                return x;
+            }
+            //x为root的red child
+            else if (!xp.red || (xpp = xp.parent) == null)
+                return root;
+            //xp为xpp的left child
+            if (xp == (xppl = xpp.left)) {
+                //xpp的right child为red node
+                if ((xppr = xpp.right) != null && xppr.red) {
+                    //这里的操作为红黑树的colorFlip操作，两个同色child与parent的颜色同时反转
+                    xppr.red = false;
+                    xp.red = false;
+                    xpp.red = true;
+                    x = xpp;
+                }
+                else {
+                    //x为parent node的right child
+                    if (x == xp.right) {
+                        //对节点x进行左旋操作
+                        root = rotateLeft(root, x = xp);
+                        //重新赋值xp与xpp
+                        xpp = (xp = x.parent) == null ? null : xp.parent;
+                    }
+                    if (xp != null) {
+                        xp.red = false;
+                        if (xpp != null) {
+                            xpp.red = true;
+                            root = rotateRight(root, xpp);
+                        }
+                    }
+                }
+            }
+            else {
+                if (xppl != null && xppl.red) {
+                    xppl.red = false;
+                    xp.red = false;
+                    xpp.red = true;
+                    x = xpp;
+                }
+                else {
+                    if (x == xp.left) {
+                        root = rotateRight(root, x = xp);
+                        xpp = (xp = x.parent) == null ? null : xp.parent;
+                    }
+                    if (xp != null) {
+                        xp.red = false;
+                        if (xpp != null) {
+                            xpp.red = true;
+                            root = rotateLeft(root, xpp);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /**
      * 更新concurrentHashMap的count值
      * @param x
