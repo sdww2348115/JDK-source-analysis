@@ -185,6 +185,36 @@ public class ConcurrentHashMap {
         assert checkInvariants(root);
     }
 
+    /**
+     * ConcurrentHashMap处构建的红黑树保证最底层节点为Red
+     * 总共有以下几种情况：
+     * 1.Node为root节点，直接将root置为black，然后返回
+     * 2.Node的父节点为Black，Node为Red，直接返回
+     * 3.Node的父节点为Red
+     *  1)Node父节点含有兄弟节点，且兄弟节点为Red
+     *          xpp                                          xpp(flip)
+     *        /     \                       ->              /          \
+     *     xp(Red)   brotherOfXp(Red)                    xp(Black)      brotherOfXp(Black)
+     *  2)xpp,xp,Node三代节点的孩子方向不同，将其转为相同方向。以Node节点为xp节点的left child，且xp为xpp的right child为例
+     *        xpp                                            xpp
+     *       /                                             /
+     *    xp(Red)                           ->           Node(Black)
+     *           \                                       /
+     *          Node(Red)                             xp(Red)
+     *    注:执行此操作后，将xp当做Node执行后续3)调整操作；Node节点为xp节点的right child，且xp为xpp的left child反之亦然
+     *  3)xpp,xp,Node三代节点孩子方向相同，执行右旋操作，并将root颜色置为黑，child颜色均置为红（Node本身颜色为红）
+     *    以left-left型为例：
+     *          xpp                                                                      xp(Black)
+     *         /                         右旋，并将根强制置为Black，叶子置为Red         /        \
+     *        xp                            ->                                       Node(Red)    xpp(Red)
+     *       /
+     *     Node(Red)
+     * @param root
+     * @param x
+     * @param <K>
+     * @param <V>
+     * @return
+     */
     static <K,V> TreeNode<K,V> balanceInsertion(TreeNode<K,V> root,
                                                 TreeNode<K,V> x) {
         x.red = true;
@@ -194,12 +224,12 @@ public class ConcurrentHashMap {
                 x.red = false;
                 return x;
             }
-            //x为root的red child
+            //调整已经结束
             else if (!xp.red || (xpp = xp.parent) == null)
                 return root;
             //xp为xpp的left child
             if (xp == (xppl = xpp.left)) {
-                //xpp的right child为red node
+                //xpp的right child为red node，在插入时进行ColorFlip操作
                 if ((xppr = xpp.right) != null && xppr.red) {
                     //这里的操作为红黑树的colorFlip操作，两个同色child与parent的颜色同时反转
                     xppr.red = false;
@@ -215,6 +245,12 @@ public class ConcurrentHashMap {
                         //重新赋值xp与xpp
                         xpp = (xp = x.parent) == null ? null : xp.parent;
                     }
+                    /**
+                     * 调整红黑树结构为
+                     *     Black
+                     *    /    \
+                     *   Red    Red
+                     */
                     if (xp != null) {
                         xp.red = false;
                         if (xpp != null) {
