@@ -52,4 +52,39 @@ public class ConcurrentLinkedQueue {
                 p = (p != t && t != (t = tail)) ? t : q;
         }
     }
+
+    /**
+     * 获取队列的最长live node
+     * @return
+     */
+    public E poll() {
+        restartFromHead:
+        for (;;) {
+            for (Node<E> h = head, p = h, q;;) {
+                E item = p.item;
+
+                /**
+                 * 这里的处理与上面offer()处一样，只有当获取的node为head.next时才会更新head所指向的node
+                 * 也是平均每两次offer()更新一次head
+                 */
+                if (item != null && p.casItem(item, null)) {
+                    // Successful CAS is the linearization point
+                    // for item to be removed from this queue.
+                    if (p != h) // hop two nodes at a time
+                        updateHead(h, ((q = p.next) != null) ? q : p);
+                    return item;
+                }
+                //队列已经为空
+                else if ((q = p.next) == null) {
+                    updateHead(h, p);
+                    return null;
+                }
+                //TODO：这里与上面offer()方法的p == q到底在何种情况下会出现？
+                else if (p == q)
+                    continue restartFromHead;
+                else
+                    p = q;
+            }
+        }
+    }
 }
