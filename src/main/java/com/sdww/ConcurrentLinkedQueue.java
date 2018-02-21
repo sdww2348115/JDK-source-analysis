@@ -65,7 +65,7 @@ public class ConcurrentLinkedQueue {
 
                 /**
                  * 这里的处理与上面offer()处一样，只有当获取的node为head.next时才会更新head所指向的node
-                 * 也是平均每两次offer()更新一次head
+                 * 也是每两次offer()更新一次head
                  */
                 if (item != null && p.casItem(item, null)) {
                     // Successful CAS is the linearization point
@@ -79,12 +79,38 @@ public class ConcurrentLinkedQueue {
                     updateHead(h, p);
                     return null;
                 }
-                //TODO：这里与上面offer()方法的p == q到底在何种情况下会出现？
+                //与上面offer()方法的p == q一样，表明node p已经被从queue中移除
                 else if (p == q)
                     continue restartFromHead;
                 else
                     p = q;
             }
         }
+    }
+
+    /**
+     * Tries to CAS head to p. If successful, repoint old head to itself
+     * as sentinel for succ(), below.
+     * 这里需要注意的是：更新完毕head所指向的Node后，原head的tail将被指向自己
+     * 也就是上面两个方法中所判断的p == q的情况！如果node.next == node，说明node已经被从queue中移除
+     */
+    final void updateHead(Node<E> h, Node<E> p) {
+        if (h != p && casHead(h, p))
+            h.lazySetNext(h);
+    }
+
+    /**
+     * 与大多数并发容器一样，size()方法并不被鼓励使用
+     * ConcurrentLinkedQueue的size方法并非O(1)，而是需要遍历queue的O(n)
+     * @return
+     */
+    public int size() {
+        int count = 0;
+        for (Node<E> p = first(); p != null; p = succ(p))
+            if (p.item != null)
+                // Collection.size() spec says to max out
+                if (++count == Integer.MAX_VALUE)
+                    break;
+        return count;
     }
 }
