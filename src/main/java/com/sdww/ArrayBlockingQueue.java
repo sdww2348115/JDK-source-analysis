@@ -79,4 +79,31 @@ public class ArrayBlockingQueue {
         }
     }
 
+    /**
+     * Extracts element at current take position, advances, and signals.
+     * Call only when holding lock.
+     */
+    private E dequeue() {
+        // assert lock.getHoldCount() == 1;
+        // assert items[takeIndex] != null;
+        final Object[] items = this.items;
+        @SuppressWarnings("unchecked")
+        E x = (E) items[takeIndex];
+        items[takeIndex] = null;
+        if (++takeIndex == items.length)
+            takeIndex = 0;
+        count--;
+        //请注意这里
+        if (itrs != null)
+            itrs.elementDequeued();
+        notFull.signal();
+        return x;
+    }
+
+    /**
+     * 个人觉得，整个ArrayBlockingQueue的核心算法相对比较简单
+     * 整个类中比较巧妙的地方在于其迭代器的算法实现
+     * 使用一个迭代器组hold住所有迭代器，并使用事件通知的方式将程序的修改传递到每一个迭代器处，最终使得每一个迭代器可以尽可能输出正确的值
+     */
+
 }
