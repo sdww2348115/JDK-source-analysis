@@ -103,7 +103,53 @@ public class ArrayBlockingQueue {
     /**
      * 个人觉得，整个ArrayBlockingQueue的核心算法相对比较简单
      * 整个类中比较巧妙的地方在于其迭代器的算法实现
-     * 使用一个迭代器组hold住所有迭代器，并使用事件通知的方式将程序的修改传递到每一个迭代器处，最终使得每一个迭代器可以尽可能输出正确的值
+     * 关键属性：
+     *  1.prevCycles:上一次调用迭代器中方法时迭代器的圈数
+     *  2.prevTakeIndex:上一次调用迭代器方法时Queue的Take方法处index，相当于队列头
+     * Itr通过prevCycles与prevTakeIndex判断Queue是否有修改，以及修改后该迭代器是否仍然有效。
+     * 大多数迭代器方法（next,remove等）都会在获取到锁之后立即调用incorporateDequeues()方法以保证操作能够正确作用于期望的值上。
+     * 同时，迭代器方法中也会多次判断当前迭代器是否失效，比如落后太多该迭代器将被判定为失效。失效的迭代器将被标记为Detached，并将会被Iters清理掉。
+     * Itr与Itrs有两个地方个人觉得设计比较巧妙：
+     *  1.使用一个迭代器组hold住所有迭代器，并使用事件通知的方式将程序的修改传递到每一个迭代器处，最终使得每一个迭代器可以尽可能输出正确的值。
+     *  每当queue中有值被删除时，都会调用Iters中的removedAt方法，将各个iter处理为能够指向正确的地址
+     *  2.在使用链表将所有迭代器组织起来时，对于iter的refrence采用的是WeakRef，当迭代器使用完后，Iters链表中iter的Ref将被GC为null。
+     *  也就是说，对于register类的处理时，我们可以把register后的ref以WeakRef的方式放在容器中，这样不会影响其本身使用完成后的GC
      */
+    private class Itr implements Iterator<E> {
 
+        /**
+         * 指向next()后的下一个位置
+         */
+        private int cursor;
+
+        /** Element to be returned by next call to next(); null if none */
+        private E nextItem;
+
+        /** Index of nextItem; NONE if none, REMOVED if removed elsewhere */
+        private int nextIndex;
+
+        /** Last element returned; null if none or not detached. */
+        private E lastItem;
+
+        /** Index of lastItem, NONE if none, REMOVED if removed elsewhere */
+        private int lastRet;
+
+        /** Previous value of takeIndex, or DETACHED when detached */
+        private int prevTakeIndex;
+
+        /** Previous value of iters.cycles */
+        private int prevCycles;
+
+        /** Special index value indicating "not available" or "undefined" */
+        private static final int NONE = -1;
+
+        /**
+         * Special index value indicating "removed elsewhere", that is,
+         * removed by some operation other than a call to this.remove().
+         */
+        private static final int REMOVED = -2;
+
+        /** Special value for prevTakeIndex indicating "detached mode" */
+        private static final int DETACHED = -3;
+    }
 }
