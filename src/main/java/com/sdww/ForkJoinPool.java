@@ -7,6 +7,7 @@ package com.sdww;
  * 用户完全不用操心线程之间的同步问题，task的调度与同步均由Fork/Join框架自动完成。
  * Fork/Join框架最核心的算法是工作偷取(work-stealing)：线程不一定仅从某个task队列中获取task，它还会从其他的队列中偷取task来运行
  * 工作偷取机制保证了task之间尽量并发操作，保证了在最坏情况下task能够尽量被平均分配。从而提高了整个框架的执行效率。
+ * 关于Fork/Join理论的相关说明请见:{@link http://github.com/oldratlee/translations/blob/master/a-java-fork-join-framework/README.md}
  */
 public class ForkJoinPool {
 }
