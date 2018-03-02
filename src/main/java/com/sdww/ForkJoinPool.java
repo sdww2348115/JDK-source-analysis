@@ -36,4 +36,288 @@ package com.sdww;
  *          4.一个简单的控制和管理类（这里指的是FJTaskRunnerGroup）来启动工作线程池，并初始化执行一个由正常的线程调用所触发的Fork/Join任务（就类似于Java程序中的main方法）。
  */
 public class ForkJoinPool {
+
+    /**
+     * ForkJoinPool的RunStatus
+     */
+    // runState bits: SHUTDOWN must be negative, others arbitrary powers of two
+    private static final int  RSLOCK     = 1;
+    private static final int  RSIGNAL    = 1 << 1;
+    private static final int  STARTED    = 1 << 2;
+    private static final int  STOP       = 1 << 29;
+    private static final int  TERMINATED = 1 << 30;
+    private static final int  SHUTDOWN   = 1 << 31;
+
+    /**
+     * 非ForkJoinPool中的task进行提交。
+     * @param task
+     */
+    final void externalPush(ForkJoinTask<?> task) {
+        WorkQueue[] ws; WorkQueue q; int m;
+        int r = ThreadLocalRandom.getProbe();
+        int rs = runState;
+        if ((ws = workQueues) != null && (m = (ws.length - 1)) >= 0 &&
+                (q = ws[m & r & SQMASK]) != null && r != 0 && rs > 0 &&
+                U.compareAndSwapInt(q, QLOCK, 0, 1)) {
+            ForkJoinTask<?>[] a; int am, n, s;
+            if ((a = q.array) != null &&
+                    (am = a.length - 1) > (n = (s = q.top) - q.base)) {
+                int j = ((am & s) << ASHIFT) + ABASE;
+                U.putOrderedObject(a, j, task);
+                U.putOrderedInt(q, QTOP, s + 1);
+                U.putIntVolatile(q, QLOCK, 0);
+                if (n <= 1)
+                    signalWork(ws, q);
+                return;
+            }
+            U.compareAndSwapInt(q, QLOCK, 1, 0);
+        }
+        externalSubmit(task);
+    }
+
+    /**
+     *
+     * @param task
+     */
+    private void externalSubmit(ForkJoinTask<?> task) {
+        int r;                                    // initialize caller's probe
+        if ((r = ThreadLocalRandom.getProbe()) == 0) {
+            ThreadLocalRandom.localInit();
+            r = ThreadLocalRandom.getProbe();
+        }
+        //上面为获取一个随机数r，下面才是核心逻辑
+        for (;;) {
+            WorkQueue[] ws; WorkQueue q; int rs, m, k;
+            boolean move = false;
+            //判断ForkJoinPool是否Terminate
+            if ((rs = runState) < 0) {
+                tryTerminate(false, false);     // help terminate
+                throw new RejectedExecutionException();
+            }
+            //ForkJoinPool刚初始化完成，还没有workQueues
+            else if ((rs & STARTED) == 0 ||     // initialize
+                    ((ws = workQueues) == null || (m = ws.length - 1) < 0)) {
+                int ns = 0;
+                //锁定 & 获取
+                rs = lockRunState();
+                try {
+                    if ((rs & STARTED) == 0) {
+                        U.compareAndSwapObject(this, STEALCOUNTER, null,
+                                new AtomicLong());
+                        // create workQueues array with size a power of two
+                        int p = config & SMASK; // ensure at least 2 slots
+                        int n = (p > 1) ? p - 1 : 1;
+                        n |= n >>> 1; n |= n >>> 2;  n |= n >>> 4;
+                        n |= n >>> 8; n |= n >>> 16; n = (n + 1) << 1;
+                        //主要逻辑在此：创健WokrQueue数组
+                        workQueues = new WorkQueue[n];
+                        ns = STARTED;
+                    }
+                } finally {
+                    unlockRunState(rs, (rs & ~RSLOCK) | ns);
+                }
+            }
+            //ForkJoinPool已经初始化完毕，含有WorkQueue数据
+            else if ((q = ws[k = r & m & SQMASK]) != null) {
+                //锁定wq
+                if (q.qlock == 0 && U.compareAndSwapInt(q, QLOCK, 0, 1)) {
+                    ForkJoinTask<?>[] a = q.array;
+                    int s = q.top;
+                    boolean submitted = false; // initial submission or resizing
+                    try {                      // locked version of push
+                        if ((a != null && a.length > s + 1 - q.base) ||
+                                //扩容
+                                (a = q.growArray()) != null) {
+                            //s的下一个位置
+                            int j = (((a.length - 1) & s) << ASHIFT) + ABASE;
+                            //使用CAS将task放入数组，并更新top的值
+                            U.putOrderedObject(a, j, task);
+                            U.putOrderedInt(q, QTOP, s + 1);
+                            submitted = true;
+                        }
+                    } finally {
+                        U.compareAndSwapInt(q, QLOCK, 1, 0);
+                    }
+                    if (submitted) {
+                        signalWork(ws, q);
+                        return;
+                    }
+                }
+                move = true;                   // move on failure
+            }
+            //创建一个新的wq
+            else if (((rs = runState) & RSLOCK) == 0) { // create new queue
+                q = new WorkQueue(this, null);
+                q.hint = r;
+                q.config = k | SHARED_QUEUE;
+                q.scanState = INACTIVE;
+                rs = lockRunState();           // publish index
+                if (rs > 0 &&  (ws = workQueues) != null &&
+                        k < ws.length && ws[k] == null)
+                    ws[k] = q;                 // else terminated
+                unlockRunState(rs, rs & ~RSLOCK);
+            }
+            else
+                move = true;                   // move if busy
+            if (move)
+                r = ThreadLocalRandom.advanceProbe(r);
+        }
+    }
+
+    /**
+     * 创建执行线程
+     * @param ws
+     * @param q
+     */
+    final void signalWork(WorkQueue[] ws, WorkQueue q) {
+        long c; int sp, i; WorkQueue v; Thread p;
+        while ((c = ctl) < 0L) {                       // too few active
+            if ((sp = (int)c) == 0) {                  // no idle workers
+                if ((c & ADD_WORKER) != 0L)            // too few workers
+                    tryAddWorker(c);
+                break;
+            }
+            if (ws == null)                            // unstarted/terminated
+                break;
+            if (ws.length <= (i = sp & SMASK))         // terminated
+                break;
+            if ((v = ws[i]) == null)                   // terminating
+                break;
+            int vs = (sp + SS_SEQ) & ~INACTIVE;        // next scanState
+            int d = sp - v.scanState;                  // screen CAS
+            long nc = (UC_MASK & (c + AC_UNIT)) | (SP_MASK & v.stackPred);
+            if (d == 0 && U.compareAndSwapLong(this, CTL, c, nc)) {
+                v.scanState = vs;                      // activate v
+                if ((p = v.parker) != null)
+                    U.unpark(p);
+                break;
+            }
+            if (q != null && q.base == q.top)          // no more work
+                break;
+        }
+    }
+
+    /**
+     * ForkJoinPool创建worker的核心逻辑
+     * @return
+     */
+    private boolean createWorker() {
+        ForkJoinWorkerThreadFactory fac = factory;
+        Throwable ex = null;
+        ForkJoinWorkerThread wt = null;
+        try {
+            if (fac != null && (wt = fac.newThread(this)) != null) {
+                wt.start();
+                return true;
+            }
+        } catch (Throwable rex) {
+            ex = rex;
+        }
+        deregisterWorker(wt, ex);
+        return false;
+    }
+
+    /**
+     * 用于管理task的内部类
+     */
+    static final class WorkQueue {
+
+
+        /**
+         * Initializes or doubles the capacity of array. Call either
+         * by owner or with lock held -- it is OK for base, but not
+         * top, to move while resizings are in progress.
+         */
+        final ForkJoinTask<?>[] growArray() {
+            ForkJoinTask<?>[] oldA = array;
+            int size = oldA != null ? oldA.length << 1 : INITIAL_QUEUE_CAPACITY;
+            if (size > MAXIMUM_QUEUE_CAPACITY)
+                throw new RejectedExecutionException("Queue capacity exceeded");
+            int oldMask, t, b;
+            //创建新queue
+            ForkJoinTask<?>[] a = array = new ForkJoinTask<?>[size];
+            //将oldqueue中的值依次移入新的queue中
+            if (oldA != null && (oldMask = oldA.length - 1) >= 0 &&
+                    (t = top) - (b = base) > 0) {
+                int mask = size - 1;
+                do { // emulate poll from old array, push to new array
+                    ForkJoinTask<?> x;
+                    int oldj = ((b & oldMask) << ASHIFT) + ABASE;
+                    int j    = ((b &    mask) << ASHIFT) + ABASE;
+                    x = (ForkJoinTask<?>)U.getObjectVolatile(oldA, oldj);
+                    if (x != null &&
+                            U.compareAndSwapObject(oldA, oldj, x, null))
+                        U.putObjectVolatile(a, j, x);
+                } while (++b != t);
+            }
+            return a;
+        }
+
+    }
+
+    /**
+     * worker线程寻找task的具体方法
+     * @param w
+     * @param r 一个随机值
+     * @return
+     */
+    private ForkJoinTask<?> scan(WorkQueue w, int r) {
+        WorkQueue[] ws; int m;
+        if ((ws = workQueues) != null && (m = ws.length - 1) > 0 && w != null) {
+            int ss = w.scanState;                     // initially non-negative
+            for (int origin = r & m, k = origin, oldSum = 0, checkSum = 0;;) {
+                WorkQueue q; ForkJoinTask<?>[] a; ForkJoinTask<?> t;
+                int b, n; long c;
+                //首先从随机的workQueue找起
+                if ((q = ws[k]) != null) {
+                    if ((n = (b = q.base) - q.top) < 0 &&
+                            (a = q.array) != null) {      // non-empty
+                        long i = (((a.length - 1) & b) << ASHIFT) + ABASE;
+                        if ((t = ((ForkJoinTask<?>)
+                                U.getObjectVolatile(a, i))) != null &&
+                                q.base == b) {
+                            //找到base处的task并赋值给t
+                            if (ss >= 0) {
+                                if (U.compareAndSwapObject(a, i, t, null)) {
+                                    q.base = b + 1;
+                                    if (n < -1)       // signal others
+                                        signalWork(ws, q);
+                                    return t;
+                                }
+                            }
+                            else if (oldSum == 0 &&   // try to activate
+                                    w.scanState < 0)
+                                tryRelease(c = ctl, ws[m & (int)c], AC_UNIT);
+                        }
+                        //重新进行scan操作
+                        if (ss < 0)                   // refresh
+                            ss = w.scanState;
+                        r ^= r << 1; r ^= r >>> 3; r ^= r << 10;
+                        origin = k = r & m;           // move and rescan
+                        oldSum = checkSum = 0;
+                        continue;
+                    }
+                    checkSum += b;
+                }
+                if ((k = (k + 1) & m) == origin) {    // continue until stable
+                    if ((ss >= 0 || (ss == (ss = w.scanState))) &&
+                            oldSum == (oldSum = checkSum)) {
+                        if (ss < 0 || w.qlock < 0)    // already inactive
+                            break;
+                        int ns = ss | INACTIVE;       // try to inactivate
+                        long nc = ((SP_MASK & ns) |
+                                (UC_MASK & ((c = ctl) - AC_UNIT)));
+                        w.stackPred = (int)c;         // hold prev stack top
+                        U.putInt(w, QSCANSTATE, ns);
+                        if (U.compareAndSwapLong(this, CTL, c, nc))
+                            ss = ns;
+                        else
+                            w.scanState = ss;         // back out
+                    }
+                    checkSum = 0;
+                }
+            }
+        }
+        return null;
+    }
 }
