@@ -48,5 +48,46 @@ public class ForkJoinTask {
         return this;
     }
 
+    /**
+     * Returns the result of the computation when it {@link #isDone is
+     * done}.  This method differs from {@link #get()} in that
+     * abnormal completion results in {@code RuntimeException} or
+     * {@code Error}, not {@code ExecutionException}, and that
+     * interrupts of the calling thread do <em>not</em> cause the
+     * method to abruptly return by throwing {@code
+     * InterruptedException}.
+     *
+     * 当task运行到isDone == done时返回结果。
+     * 其与future.get()不同主要有以下几个地方不同：
+     * 1.运算结果为RuntimeException或者Error
+     * 2.非ExecutionException
+     * 3.通过某种方法使得运行程序中断时，不会抛出interrupted exception
+     *
+     * @return the computed result
+     */
+    public final V join() {
+        int s;
+        if ((s = doJoin() & DONE_MASK) != NORMAL)
+            reportException(s);
+        return getRawResult();
+    }
+
+    /**
+     * Implementation for join, get, quietlyJoin. Directly handles
+     * only cases of already-completed, external wait, and
+     * unfork+exec.  Others are relayed to ForkJoinPool.awaitJoin.
+     *
+     * @return status upon completion
+     */
+    private int doJoin() {
+        int s; Thread t; ForkJoinWorkerThread wt; ForkJoinPool.WorkQueue w;
+        return (s = status) < 0 ? s ://status < 0 代表异常，返回异常status
+                ((t = Thread.currentThread()) instanceof ForkJoinWorkerThread) ?
+                        (w = (wt = (ForkJoinWorkerThread)t).workQueue).
+                                tryUnpush(this) && (s = doExec()) < 0 ? s :
+                                wt.pool.awaitJoin(w, this, 0L) :
+                        externalAwaitDone();
+    }
+
 
 }

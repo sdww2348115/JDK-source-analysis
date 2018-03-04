@@ -253,10 +253,53 @@ public class ForkJoinPool {
             return a;
         }
 
+        /**
+         * Pushes a task. Call only by owner in unshared queues.  (The
+         * shared-queue version is embedded in method externalPush.)
+         * 将一个task直接push到queue中(top位置)
+         * @param task the task. Caller must ensure non-null.
+         * @throws RejectedExecutionException if array cannot be resized
+         */
+        final void push(ForkJoinTask<?> task) {
+            ForkJoinTask<?>[] a; ForkJoinPool p;
+            int b = base, s = top, n;
+            if ((a = array) != null) {    // ignore if queue removed
+                int m = a.length - 1;     // fenced write for task visibility
+                U.putOrderedObject(a, ((m & s) << ASHIFT) + ABASE, task);
+                U.putOrderedInt(this, QTOP, s + 1);
+                //需要signal的情况
+                if ((n = s - b) <= 1) {
+                    if ((p = pool) != null)
+                        p.signalWork(p.workQueues, this);
+                }
+                //插入新数据后，queue太大了，需要扩大其容量
+                else if (n >= m)
+                    growArray();
+            }
+        }
+
     }
 
     /**
-     * worker线程寻找task的具体方法
+     * Top-level runloop for workers, called by ForkJoinWorkerThread.run.
+     * 启动一个worker，请注意这里的worker的queue应为null，所以worker的第一个任务需要从其他queue中steal
+     */
+    final void runWorker(WorkQueue w) {
+        w.growArray();                   // allocate queue
+        int seed = w.hint;               // initially holds randomization hint
+        int r = (seed == 0) ? 1 : seed;  // avoid 0 for xorShift
+        for (ForkJoinTask<?> t;;) {
+            //steal work & execute
+            if ((t = scan(w, r)) != null)
+                w.runTask(t);
+            else if (!awaitWork(w, r))
+                break;
+            r ^= r << 13; r ^= r >>> 17; r ^= r << 5; // xorshift
+        }
+    }
+
+    /**
+     * worker线程寻找task的具体方法,偷取其他queue base处的值
      * @param w
      * @param r 一个随机值
      * @return
@@ -299,7 +342,9 @@ public class ForkJoinPool {
                     }
                     checkSum += b;
                 }
+                //请注意这里的隐藏逻辑：k = (k + 1) & m：典型线性探测法
                 if ((k = (k + 1) & m) == origin) {    // continue until stable
+                    //后面的操作均为将ss置为inactive
                     if ((ss >= 0 || (ss == (ss = w.scanState))) &&
                             oldSum == (oldSum = checkSum)) {
                         if (ss < 0 || w.qlock < 0)    // already inactive
@@ -319,5 +364,22 @@ public class ForkJoinPool {
             }
         }
         return null;
+    }
+
+    /**
+     * Pops the given task only if it is at the current top.
+     * (A shared version is available only via FJP.tryExternalUnpush)
+     * FJT从自己的workQueue中pop一个任务出来(获取top处的task)
+     * 由于是自己独占的workQueue，所以不需要加锁
+     */
+    final boolean tryUnpush(ForkJoinTask<?> t) {
+        ForkJoinTask<?>[] a; int s;
+        if ((a = array) != null && (s = top) != base &&
+                U.compareAndSwapObject
+                        (a, (((a.length - 1) & --s) << ASHIFT) + ABASE, t, null)) {
+            U.putOrderedInt(this, QTOP, s);
+            return true;
+        }
+        return false;
     }
 }
