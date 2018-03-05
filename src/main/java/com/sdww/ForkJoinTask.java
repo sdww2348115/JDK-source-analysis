@@ -32,6 +32,36 @@ package com.sdww;
  */
 public class ForkJoinTask {
 
+    /** The run status of this task */
+    /*
+     高4位用来标记完成状态:
+     DONE_MASK
+     NORMAL
+     CANCELLED
+     EXCEPTIONAL
+     最低16位用来做tags:SMASK
+     第17位用来标记是否需要在完成后signal其他线程:SIGNAL
+     */
+    volatile int status; // accessed directly by pool and workers
+    static final int DONE_MASK   = 0xf0000000;  // mask out non-completion bits
+    static final int NORMAL      = 0xf0000000;  // must be negative
+    static final int CANCELLED   = 0xc0000000;  // must be < NORMAL
+    static final int EXCEPTIONAL = 0x80000000;  // must be < CANCELLED
+    static final int SIGNAL      = 0x00010000;  // must be >= 1 << 16
+    static final int SMASK       = 0x0000ffff;  // short bits for tags
+
+    /**
+     * Table of exceptions thrown by tasks, to enable reporting by
+     * callers. Because exceptions are rare, we don't directly keep
+     * them with task objects, but instead use a weak ref table.  Note
+     * that cancellation exceptions don't appear in the table, but are
+     * instead recorded as status values.
+     *
+     * Note: These statics are initialized below in static block.
+     * FJT使用一个array来保存exception，cancelled Exception将不被保存在这里面，而是通过status表明
+     */
+    private static final ExceptionNode[] exceptionTable;
+
     /**
      * 一般情况下，在一个task被完成并重新初始化前多次调用fork()方法会导致错误发生
      * 当前线程执行join()或返回true之前，其他线程对该task的修改并不一定对该线程可见！
@@ -84,9 +114,127 @@ public class ForkJoinTask {
         return (s = status) < 0 ? s ://status < 0 代表异常，返回异常status
                 ((t = Thread.currentThread()) instanceof ForkJoinWorkerThread) ?
                         (w = (wt = (ForkJoinWorkerThread)t).workQueue).
+                                //从workQueue中将当前task取出来并执行
                                 tryUnpush(this) && (s = doExec()) < 0 ? s :
                                 wt.pool.awaitJoin(w, this, 0L) :
                         externalAwaitDone();
+    }
+
+    /**
+     * Primary execution method for stolen tasks. Unless done, calls
+     * exec and records status if completed, but doesn't wait for
+     * completion otherwise.
+     *
+     * @return status on exit from this method
+     */
+    final int doExec() {
+        int s; boolean completed;
+        if ((s = status) >= 0) {
+            try {
+                completed = exec();
+            } catch (Throwable rex) {
+                //关于Exception的处理
+                return setExceptionalCompletion(rex);
+            }
+            if (completed)
+                //如何标记为完成
+                s = setCompletion(NORMAL);
+        }
+        return s;
+    }
+
+    /**
+     * Marks completion and wakes up threads waiting to join this
+     * task.
+     * 对于该方法只用注意一点：使用notifyAll()方法通知其他线程。说明FJ框架的通知机制是基于wait()/notifyAll()的
+     *
+     * @param completion one of NORMAL, CANCELLED, EXCEPTIONAL
+     * @return completion status on exit
+     */
+    private int setCompletion(int completion) {
+        for (int s;;) {
+            if ((s = status) < 0)
+                return s;
+            if (U.compareAndSwapInt(this, STATUS, s, s | completion)) {
+                //请注意，status为NOMAL、EXCEPTIONAL、CANCELLED，无论SIGNAL是否为1都会出发notifyAll()
+                if ((s >>> 16) != 0)
+                    synchronized (this) { notifyAll(); }
+                return completion;
+            }
+        }
+    }
+
+    /**
+     * Records exception and possibly propagates.
+     * 记录异常，触发回调/传播
+     *
+     * @return status on exit
+     */
+    private int setExceptionalCompletion(Throwable ex) {
+        int s = recordExceptionalCompletion(ex);
+        if ((s & DONE_MASK) == EXCEPTIONAL)
+            internalPropagateException(ex);
+        return s;
+    }
+
+    /**
+     * Records exception and sets status.
+     *
+     * @return status on exit
+     */
+    final int recordExceptionalCompletion(Throwable ex) {
+        int s;
+        if ((s = status) >= 0) {
+            int h = System.identityHashCode(this);
+            final ReentrantLock lock = exceptionTableLock;
+            lock.lock();
+            try {
+                expungeStaleExceptions();
+                //根据hash值将exception放入table中，链表解决冲突问题
+                ExceptionNode[] t = exceptionTable;
+                int i = h & (t.length - 1);
+                for (ExceptionNode e = t[i]; ; e = e.next) {
+                    if (e == null) {
+                        t[i] = new ExceptionNode(this, ex, t[i]);
+                        break;
+                    }
+                    if (e.get() == this) // already present
+                        break;
+                }
+            } finally {
+                lock.unlock();
+            }
+            s = setCompletion(EXCEPTIONAL);
+        }
+        return s;
+    }
+
+    /**
+     * 从exceptionTable中删除所有exceptionTableRefQueue中的exceptionNode
+     * Poll stale refs and remove them. Call only while holding lock.
+     */
+    private static void expungeStaleExceptions() {
+        for (Object x; (x = exceptionTableRefQueue.poll()) != null;) {
+            if (x instanceof ExceptionNode) {
+                int hashCode = ((ExceptionNode)x).hashCode;
+                ExceptionNode[] t = exceptionTable;
+                int i = hashCode & (t.length - 1);
+                ExceptionNode e = t[i];
+                ExceptionNode pred = null;
+                while (e != null) {
+                    ExceptionNode next = e.next;
+                    if (e == x) {
+                        if (pred == null)
+                            t[i] = next;
+                        else
+                            pred.next = next;
+                        break;
+                    }
+                    pred = e;
+                    e = next;
+                }
+            }
+        }
     }
 
 
