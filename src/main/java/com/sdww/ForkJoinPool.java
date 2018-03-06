@@ -382,4 +382,48 @@ public class ForkJoinPool {
         }
         return false;
     }
+
+    /**
+     * Helps and/or blocks until the given task is done or timeout.
+     * 等待一个task执行完成
+     *
+     * @param w caller
+     * @param task the task
+     * @param deadline for timed waits, if nonzero
+     * @return task status on exit
+     */
+    final int awaitJoin(WorkQueue w, ForkJoinTask<?> task, long deadline) {
+        int s = 0;
+        if (task != null && w != null) {
+            ForkJoinTask<?> prevJoin = w.currentJoin;
+            U.putOrderedObject(w, QCURRENTJOIN, task);
+            CountedCompleter<?> cc = (task instanceof CountedCompleter) ?
+                    (CountedCompleter<?>)task : null;
+            for (;;) {
+                if ((s = task.status) < 0)
+                    break;
+                if (cc != null)
+                    helpComplete(w, cc, 0);
+                //请注意这里为重点
+                else if (w.base == w.top || w.tryRemoveAndExec(task)) //tryRemoveAndExec(task)方法将从queue中找到并获取task，执行之
+                    //否则steal其他queue的task并执行
+                    helpStealer(w, task);
+                if ((s = task.status) < 0)
+                    break;
+                long ms, ns;
+                if (deadline == 0L)
+                    ms = 0L;
+                else if ((ns = deadline - System.nanoTime()) <= 0L)
+                    break;
+                else if ((ms = TimeUnit.NANOSECONDS.toMillis(ns)) <= 0L)
+                    ms = 1L;
+                if (tryCompensate(w)) {
+                    task.internalWait(ms);
+                    U.getAndAddLong(this, CTL, AC_UNIT);
+                }
+            }
+            U.putOrderedObject(w, QCURRENTJOIN, prevJoin);
+        }
+        return s;
+    }
 }
