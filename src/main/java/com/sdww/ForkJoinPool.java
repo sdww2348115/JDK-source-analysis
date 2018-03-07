@@ -596,5 +596,56 @@ public class ForkJoinPool {
         }
     }
 
+    /**
+     * Callback from ForkJoinWorkerThread constructor to establish and
+     * record its WorkQueue.
+     * 创建FJWorker时的注册方法
+     * 主要目的是找到与该worker thread相绑定的work queue
+     * 所有与worker绑定的workQueue必须位于ws中的奇数位置，请注意这里与helpStealer方法处呼应
+     *
+     * @param wt the worker thread
+     * @return the worker's queue
+     */
+    final WorkQueue registerWorker(ForkJoinWorkerThread wt) {
+        UncaughtExceptionHandler handler;
+        wt.setDaemon(true);                           // configure thread
+        if ((handler = ueh) != null)
+            wt.setUncaughtExceptionHandler(handler);
+        WorkQueue w = new WorkQueue(this, wt);
+        int i = 0;                                    // assign a pool index
+        int mode = config & MODE_MASK;
+        int rs = lockRunState();
+        try {
+            WorkQueue[] ws; int n;                    // skip if no array
+            if ((ws = workQueues) != null && (n = ws.length) > 0) {
+                int s = indexSeed += SEED_INCREMENT;  // unlikely to collide
+                int m = n - 1;
+                //此处保证i为奇数
+                i = ((s << 1) | 1) & m;               // odd-numbered indices
+                if (ws[i] != null) {                  // collision
+                    int probes = 0;                   // step by approx half n
+                    int step = (n <= 4) ? 2 : ((n >>> 1) & EVENMASK) + 2;
+                    //每次前进step步找到ws中的空位
+                    while (ws[i = (i + step) & m] != null) {
+                        //遍历完ws均未找到空位，对ws进行扩容，变为原来的两倍大小
+                        if (++probes >= n) {
+                            workQueues = ws = Arrays.copyOf(ws, n <<= 1);
+                            m = n - 1;
+                            probes = 0;
+                        }
+                    }
+                }
+                w.hint = s;                           // use as random seed
+                w.config = i | mode;
+                w.scanState = i;                      // publication fence
+                ws[i] = w;
+            }
+        } finally {
+            unlockRunState(rs, rs & ~RSLOCK);
+        }
+        wt.setName(workerNamePrefix.concat(Integer.toString(i >>> 1)));
+        return w;
+    }
+
 
 }
