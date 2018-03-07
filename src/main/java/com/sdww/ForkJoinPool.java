@@ -299,7 +299,44 @@ public class ForkJoinPool {
     }
 
     /**
+     * Tries to add one worker, incrementing ctl counts before doing
+     * so, relying on createWorker to back out on failure.
+     * 添加一个worker线程
+     *
+     * @param c incoming ctl value, with total count negative and no
+     * idle workers.  On CAS failure, c is refreshed and retried if
+     * this holds (otherwise, a new worker is not needed).
+     */
+    private void tryAddWorker(long c) {
+        boolean add = false;
+        do {
+            //这里与ctl操作有关，由于ctl中AC定义为负数，因此这里c + AC_UNIT意味着ctl中active worker的数量+1
+            //TC_UNIT同理
+            long nc = ((AC_MASK & (c + AC_UNIT)) |
+                    (TC_MASK & (c + TC_UNIT)));
+            if (ctl == c) {
+                int rs, stop;                 // check if terminating
+                if ((stop = (rs = lockRunState()) & STOP) == 0)
+                    //原子更新ctl
+                    add = U.compareAndSwapLong(this, CTL, c, nc);
+                unlockRunState(rs, rs & ~RSLOCK);
+                if (stop != 0)
+                    break;
+                if (add) {
+                    createWorker();
+                    break;
+                }
+            }
+        } while (((c = ctl) & ADD_WORKER) != 0L && (int)c == 0);
+    }
+
+    /**
      * worker线程寻找task的具体方法,偷取其他queue base处的值
+     * 扫描并尝试偷取一个top leavel的task。扫描从一个随机位置开始，随机前进一个位置，或者进行线性查找，
+     直到:
+     1.将wq遍历了一圈
+     2.所有ws[i]为null
+     此时worker将试图inactive并且重新执行scan过程，如果找到了新的task则重新激活自己或者其他worker，否则return null并阻塞等待任务。scan方法将尽可能少的执行内存操作，减少中断其他执行scan方法的线程。
      * @param w
      * @param r 一个随机值
      * @return
@@ -332,7 +369,7 @@ public class ForkJoinPool {
                                     w.scanState < 0)
                                 tryRelease(c = ctl, ws[m & (int)c], AC_UNIT);
                         }
-                        //重新进行scan操作
+                        //ss < 0说明scan过程已经被停止了
                         if (ss < 0)                   // refresh
                             ss = w.scanState;
                         r ^= r << 1; r ^= r >>> 3; r ^= r << 10;
@@ -426,4 +463,138 @@ public class ForkJoinPool {
         }
         return s;
     }
+
+    /**
+     * If present, removes from queue and executes the given task,
+     * or any other cancelled task. Used only by awaitJoin.
+     * 从task的当前workQueue中拿到目标task并执行（即join的目标task在当前workQueue中）
+     *
+     * @return true if queue empty and task not known to be done
+     */
+    final boolean tryRemoveAndExec(ForkJoinTask<?> task) {
+        ForkJoinTask<?>[] a; int m, s, b, n;
+        if ((a = array) != null && (m = a.length - 1) >= 0 &&
+                task != null) {
+            while ((n = (s = top) - (b = base)) > 0) {
+                for (ForkJoinTask<?> t;;) {      // traverse from s to b
+                    //从top开始遍历整个workQueue
+                    long j = ((--s & m) << ASHIFT) + ABASE;
+                    if ((t = (ForkJoinTask<?>)U.getObject(a, j)) == null)
+                        return s + 1 == top;     // shorter than expected
+                    //找到了目标task
+                    else if (t == task) {
+                        boolean removed = false;
+                        //目标即为top，那么与一般pop操作一致，直接使用null替换task即可
+                        if (s + 1 == top) {      // pop
+                            if (U.compareAndSwapObject(a, j, task, null)) {
+                                U.putOrderedInt(this, QTOP, s);
+                                removed = true;
+                            }
+                        }
+                        //目标不为top，需要用EmptyTask替换对应位置的task节点
+                        else if (base == b)      // replace with proxy
+                            removed = U.compareAndSwapObject(
+                                    a, j, task, new EmptyTask());
+                        if (removed)
+                            task.doExec();
+                        break;
+                    }
+                    else if (t.status < 0 && s + 1 == top) {
+                        if (U.compareAndSwapObject(a, j, t, null))
+                            U.putOrderedInt(this, QTOP, s);
+                        break;                  // was cancelled
+                    }
+                    if (--n == 0)
+                        return false;
+                }
+                if (task.status < 0)
+                    return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Tries to locate and execute tasks for a stealer of the given
+     * task, or in turn one of its stealers, Traces currentSteal ->
+     * currentJoin links looking for a thread working on a descendant
+     * of the given task and with a non-empty queue to steal back and
+     * execute tasks from. The first call to this method upon a
+     * waiting join will often entail scanning/search, (which is OK
+     * because the joiner has nothing better to do), but this method
+     * leaves hints in workers to speed up subsequent calls.
+     * 调用该方法的前提是:该task所join的目标task不在当前workQueue中。
+     * 为何会出现这样的情况呢？
+     * 唯一的答案便是，target task被别的worker steal了，所以该方法的任务是将target task steal回来，尽快执行下去。
+     *
+     * @param w caller
+     * @param task the task to join
+     */
+    private void helpStealer(WorkQueue w, ForkJoinTask<?> task) {
+        WorkQueue[] ws = workQueues;
+        int oldSum = 0, checkSum, m;
+        if (ws != null && (m = ws.length - 1) >= 0 && w != null &&
+                task != null) {
+            do {                                       // restart point
+                checkSum = 0;                          // for stability check
+                ForkJoinTask<?> subtask;
+                WorkQueue j = w, v;                    // v is subtask stealer
+                descent: for (subtask = task; subtask.status >= 0; ) {
+                    //找到到底是哪个workQueue的worker偷走了target task
+                    for (int h = j.hint | 1, k = 0, i; ; k += 2) {
+                        if (k > m)                     // can't find stealer
+                            break descent;
+                        if ((v = ws[i = (h + k) & m]) != null) {
+                            if (v.currentSteal == subtask) {
+                                j.hint = i;
+                                break;
+                            }
+                            checkSum += v.base;
+                        }
+                    }
+                    //将task steal回来并执行
+                    for (;;) {                         // help v or descend
+                        ForkJoinTask<?>[] a; int b;
+                        checkSum += (b = v.base);
+                        ForkJoinTask<?> next = v.currentJoin;
+                        //判断target task的status，以及当前currentJoin是否仍为subtask
+                        if (subtask.status < 0 || j.currentJoin != subtask ||
+                                v.currentSteal != subtask) // stale
+                            break descent;
+                        if (b - v.top >= 0 || (a = v.array) == null) {
+                            if ((subtask = next) == null)
+                                break descent;
+                            j = v;
+                            break;
+                        }
+                        //找到了target task，steal回来并执行！
+                        int i = (((a.length - 1) & b) << ASHIFT) + ABASE;
+                        ForkJoinTask<?> t = ((ForkJoinTask<?>)
+                                U.getObjectVolatile(a, i));
+                        if (v.base == b) {
+                            if (t == null)             // stale
+                                break descent;
+                            if (U.compareAndSwapObject(a, i, t, null)) {
+                                v.base = b + 1;
+                                ForkJoinTask<?> ps = w.currentSteal;
+                                int top = w.top;
+                                //将target task steal回来后，还需要继续执行下去
+                                do {
+                                    U.putOrderedObject(w, QCURRENTSTEAL, t);
+                                    t.doExec();        // clear local tasks too
+                                } while (task.status >= 0 &&
+                                        w.top != top &&
+                                        (t = w.pop()) != null);
+                                U.putOrderedObject(w, QCURRENTSTEAL, ps);
+                                if (w.base != w.top)
+                                    return;            // can't further help
+                            }
+                        }
+                    }
+                }
+            } while (task.status >= 0 && oldSum != (oldSum = checkSum));
+        }
+    }
+
+
 }
