@@ -48,6 +48,20 @@ public class ForkJoinPool {
     private static final int  TERMINATED = 1 << 30;
     private static final int  SHUTDOWN   = 1 << 31;
 
+
+    /**
+     * 该属性为ForkJoinPool重要属性，其含义为：
+     * AC: Number of active running workers minus target parallelism 活动线程数 - 并发量
+     * TC: Number of total workers minus target parallelism          总线程数 - 并发量
+     * 后16位仅与第一个wait线程有关!!!
+     * 线程的wait是链表存储，header保存在ctl中，每个workqueue的stackPred相当于node的next
+     * 低16位的第一位：表示线程是否处于活跃状态，如果是，则该位为0
+     * SS: version count and status of top waiting thread
+     * 低16位的后15位，ws[i]能够直接定位到与worker绑定的queue上
+     * ID: poolIndex of top of Treiber stack of waiters
+     */
+    volatile long ctl;                   // main pool control
+
     /**
      * 非ForkJoinPool中的task进行提交。
      * @param task
@@ -701,6 +715,77 @@ public class ForkJoinPool {
             else
                 pollAndExecAll();
         }
+    }
+
+    /**
+     * Possibly blocks worker w waiting for a task to steal, or
+     * returns false if the worker should terminate.  If inactivating
+     * w has caused the pool to become quiescent, checks for pool
+     * termination, and, so long as this is not the only worker, waits
+     * for up to a given duration.  On timeout, if ctl has not
+     * changed, terminates the worker, which will in turn wake up
+     * another worker to possibly repeat this process.
+     * 当做完自己queue中的任务后，且没有steal到task，进入该方法，准备进入block状态
+     *
+     * @param w the calling worker
+     * @param r a random seed (for spins)
+     * @return false if the worker should terminate
+     */
+    private boolean awaitWork(WorkQueue w, int r) {
+        if (w == null || w.qlock < 0)                 // w is terminating
+            return false;
+        for (int pred = w.stackPred, spins = SPINS, ss;;) {
+            if ((ss = w.scanState) >= 0)
+                break;
+            else if (spins > 0) {
+                r ^= r << 6; r ^= r >>> 21; r ^= r << 7;
+                if (r >= 0 && --spins == 0) {         // randomize spins
+                    WorkQueue v; WorkQueue[] ws; int s, j; AtomicLong sc;
+                    if (pred != 0 && (ws = workQueues) != null &&
+                            (j = pred & SMASK) < ws.length &&
+                            (v = ws[j]) != null &&        // see if pred parking
+                            (v.parker == null || v.scanState >= 0))
+                        spins = SPINS;                // continue spinning
+                }
+            }
+            else if (w.qlock < 0)                     // recheck after spins
+                return false;
+            else if (!Thread.interrupted()) {
+                long c, prevctl, parkTime, deadline;
+                int ac = (int)((c = ctl) >> AC_SHIFT) + (config & SMASK);
+                //当前activeWorker总数小于等于0， 则结束
+                if ((ac <= 0 && tryTerminate(false, false)) ||
+                        (runState & STOP) != 0)           // pool terminating
+                    return false;
+                //当前active的worker数量为0，并且ctl指向自己所绑定的queue
+                if (ac <= 0 && ss == (int)c) {        // is last waiter
+                    //找到之前的waiter
+                    prevctl = (UC_MASK & (c + AC_UNIT)) | (SP_MASK & pred);
+                    int t = (short)(c >>> TC_SHIFT);  // shrink excess spares
+                    //总worker数量大于2的情况下，自己从Blocking状态恢复，需要将ctl指向之前的waiter
+                    if (t > 2 && U.compareAndSwapLong(this, CTL, c, prevctl))
+                        return false;                 // else use timed wait
+                    parkTime = IDLE_TIMEOUT * ((t >= 0) ? 1 : 1 - t);
+                    deadline = System.nanoTime() + parkTime - TIMEOUT_SLOP;
+                }
+                else
+                    prevctl = parkTime = deadline = 0L;
+                Thread wt = Thread.currentThread();
+                U.putObject(wt, PARKBLOCKER, this);   // emulate LockSupport
+                w.parker = wt;
+                if (w.scanState < 0 && ctl == c)      // recheck before park
+                    U.park(false, parkTime);
+                U.putOrderedObject(w, QPARKER, null);
+                U.putObject(wt, PARKBLOCKER, null);
+                if (w.scanState >= 0)
+                    break;
+                if (parkTime != 0L && ctl == c &&
+                        deadline - System.nanoTime() <= 0L &&
+                        U.compareAndSwapLong(this, CTL, c, prevctl))
+                    return false;                     // shrink pool
+            }
+        }
+        return true;
     }
 
 
