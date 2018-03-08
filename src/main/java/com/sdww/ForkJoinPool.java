@@ -76,6 +76,27 @@ public class ForkJoinPool {
     }
 
     /**
+     * Executes the given task and any remaining local tasks.
+     * 从一个task（root）开始运行
+     */
+    final void runTask(ForkJoinTask<?> task) {
+        if (task != null) {
+            //SCANNING为1，因此scanState &= ~SCANNING意味着将scanState的最末位置为0
+            scanState &= ~SCANNING; // mark as busy
+            (currentSteal = task).doExec();
+            U.putOrderedObject(this, QCURRENTSTEAL, null); // release for GC
+            execLocalTasks();
+            ForkJoinWorkerThread thread = owner;
+            if (++nsteals < 0)      // collect on overflow
+                transferStealCount(pool);
+            //与上面类似，下面意味着将scanState的最末位置为1（即为奇数）
+            scanState |= SCANNING;
+            if (thread != null)
+                thread.afterTopLevelExec();
+        }
+    }
+
+    /**
      *
      * @param task
      */
@@ -337,6 +358,8 @@ public class ForkJoinPool {
      1.将wq遍历了一圈
      2.所有ws[i]为null
      此时worker将试图inactive并且重新执行scan过程，如果找到了新的task则重新激活自己或者其他worker，否则return null并阻塞等待任务。scan方法将尽可能少的执行内存操作，减少中断其他执行scan方法的线程。
+
+     worker线程steal其他task的前提是做完自己queue中的所有内容！
      * @param w
      * @param r 一个随机值
      * @return
@@ -360,6 +383,7 @@ public class ForkJoinPool {
                             if (ss >= 0) {
                                 if (U.compareAndSwapObject(a, i, t, null)) {
                                     q.base = b + 1;
+                                    //自己能够steal到task，且该queue还没有空，因此还需要唤醒其他worker
                                     if (n < -1)       // signal others
                                         signalWork(ws, q);
                                     return t;
