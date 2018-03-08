@@ -671,5 +671,37 @@ public class ForkJoinPool {
         return w;
     }
 
+    /**
+     * Removes and executes all local tasks. If LIFO, invokes
+     * pollAndExecAll. Otherwise implements a specialized pop loop
+     * to exec until empty.
+     * FJPool如何处理pop与steal的冲突问题呢？
+     * 关键在于该方法中的getAndSetObject
+     * 以及scan方法中的处理方式
+     * 对于获取localTask而言，worker thread直接使用getAndSetObject来获取TOP-1位置处的task
+     * 而对于steal的scan方法而言，worker thread则始终以compareAndSwapObject方法尝试获取base处的task
+     * 这样就完全避免了pop与steal的冲突
+     */
+    final void execLocalTasks() {
+        int b = base, m, s;
+        ForkJoinTask<?>[] a = array;
+        if (b - (s = top - 1) <= 0 && a != null &&
+                (m = a.length - 1) >= 0) {
+            if ((config & FIFO_QUEUE) == 0) {
+                for (ForkJoinTask<?> t;;) {
+                    if ((t = (ForkJoinTask<?>)U.getAndSetObject
+                            (a, ((m & s) << ASHIFT) + ABASE, null)) == null)
+                        break;
+                    U.putOrderedInt(this, QTOP, s);
+                    t.doExec();
+                    if (base - (s = top - 1) > 0)
+                        break;
+                }
+            }
+            else
+                pollAndExecAll();
+        }
+    }
+
 
 }
