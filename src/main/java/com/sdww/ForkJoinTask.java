@@ -237,5 +237,74 @@ public class ForkJoinTask {
         }
     }
 
+    /**
+     * Returns a rethrowable exception for the given task, if
+     * available. To provide accurate stack traces, if the exception
+     * was not thrown by the current thread, we try to create a new
+     * exception of the same type as the one thrown, but with the
+     * recorded exception as its cause. If there is no such
+     * constructor, we instead try to use a no-arg constructor,
+     * followed by initCause, to the same effect. If none of these
+     * apply, or any fail due to other exceptions, we return the
+     * recorded exception, which is still correct, although it may
+     * contain a misleading stack trace.
+     *
+     * 所有worker的exception都保存在exceptionTable中，每个task根据自己的hash值将产生的exception放入table中对应位置处
+     * 如果产生冲突，则以链表方式保存exception
+     *
+     * @return the exception, or null if none
+     */
+    private Throwable getThrowableException() {
+        if ((status & DONE_MASK) != EXCEPTIONAL)
+            return null;
+        int h = System.identityHashCode(this);
+        ExceptionNode e;
+        final ReentrantLock lock = exceptionTableLock;
+        //找到属于当前task的exception
+        lock.lock();
+        try {
+            expungeStaleExceptions();
+            ExceptionNode[] t = exceptionTable;
+            e = t[h & (t.length - 1)];
+            while (e != null && e.get() != this)
+                e = e.next;
+        } finally {
+            lock.unlock();
+        }
+        //e为当前task所抛出的exception
+        Throwable ex;
+        if (e == null || (ex = e.ex) == null)
+            return null;
+        //exception并非由当前线程抛出
+        //1.该task来自于steal其他workqueue
+        //2.该task被其他worker steal并执行了
+        if (e.thrower != Thread.currentThread().getId()) {
+            Class<? extends Throwable> ec = ex.getClass();
+            try {
+                Constructor<?> noArgCtor = null;
+                Constructor<?>[] cs = ec.getConstructors();// public ctors only
+                for (int i = 0; i < cs.length; ++i) {
+                    Constructor<?> c = cs[i];
+                    Class<?>[] ps = c.getParameterTypes();
+                    if (ps.length == 0)
+                        noArgCtor = c;
+                    else if (ps.length == 1 && ps[0] == Throwable.class) {
+                        Throwable wx = (Throwable)c.newInstance(ex);
+                        return (wx == null) ? ex : wx;
+                    }
+                }
+                if (noArgCtor != null) {
+                    Throwable wx = (Throwable)(noArgCtor.newInstance());
+                    if (wx != null) {
+                        wx.initCause(ex);
+                        return wx;
+                    }
+                }
+            } catch (Exception ignore) {
+            }
+        }
+        return ex;
+    }
+
 
 }
