@@ -246,7 +246,7 @@ public class ThreadPoolExecutor {
                         //workers是一个hashTable
                         workers.add(w);
                         int s = workers.size();
-                        //按照这里的代码逻辑，难道s还能大于largestPoolSize？？？
+                        //记录最大线程池大小的值
                         if (s > largestPoolSize)
                             largestPoolSize = s;
                         workerAdded = true;
