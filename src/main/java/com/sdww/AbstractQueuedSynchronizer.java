@@ -178,4 +178,137 @@ public class AbstractQueuedSynchronizer {
                 cancelAcquire(node);
         }
     }
+
+    /**
+     * Checks and updates status for a node that failed to acquire.
+     * Returns true if thread should block. This is the main signal
+     * control in all acquire loops.  Requires that pred == node.prev.
+     *
+     * 重要方法：这里需要注意的是，每个线程由此决定它pred.waitStatus
+     * 如果当前线程需要阻塞，则将pred.waitStatus置为SIGNAL状态
+     * 该特性是由CLH 数据结构决定的
+     *
+     * @param pred node's predecessor holding status
+     * @param node the node
+     * @return {@code true} if thread should block
+     */
+    private static boolean shouldParkAfterFailedAcquire(Node pred, Node node) {
+        int ws = pred.waitStatus;
+        if (ws == Node.SIGNAL)
+            /*
+             * This node has already set status asking a release
+             * to signal it, so it can safely park.
+             */
+            return true;
+        //只有cacelled一种情况
+        if (ws > 0) {
+            /*
+             * Predecessor was cancelled. Skip over predecessors and
+             * indicate retry.
+             */
+            do {
+                node.prev = pred = pred.prev;
+            } while (pred.waitStatus > 0);
+            pred.next = node;
+        } else {
+            /*
+             * waitStatus must be 0 or PROPAGATE.  Indicate that we
+             * need a signal, but don't park yet.  Caller will need to
+             * retry to make sure it cannot acquire before parking.
+             * 在独占模式下，pred.status == 0，说明pred为head，当前线程不需要park
+             */
+            compareAndSetWaitStatus(pred, ws, Node.SIGNAL);
+        }
+        return false;
+    }
+
+    /**
+     * Acquires in exclusive interruptible mode.
+     * 与acquireQueued差不多，只是把addWaiter方法纳入了该方法内部
+     * 与普通 acquire不同仅在于遇到interrupted时将抛出错误，而不是返回一个标志位
+     * @param arg the acquire argument
+     */
+    private void doAcquireInterruptibly(int arg)
+            throws InterruptedException {
+        final Node node = addWaiter(Node.EXCLUSIVE);
+        boolean failed = true;
+        try {
+            for (;;) {
+                final Node p = node.predecessor();
+                if (p == head && tryAcquire(arg)) {
+                    setHead(node);
+                    p.next = null; // help GC
+                    failed = false;
+                    return;
+                }
+                if (shouldParkAfterFailedAcquire(p, node) &&
+                        parkAndCheckInterrupt())
+                    throw new InterruptedException();
+            }
+        } finally {
+            if (failed)
+                cancelAcquire(node);
+        }
+    }
+
+    /**
+     * Cancels an ongoing attempt to acquire.
+     *
+     * @param node the node
+     */
+    private void cancelAcquire(Node node) {
+        // Ignore if node doesn't exist
+        if (node == null)
+            return;
+
+        //step1.将node.thread置为null,因为该项无意义了
+        node.thread = null;
+
+        // Skip cancelled predecessors
+        // 这里的隐含逻辑为去掉Queue中该node之前所有waitStatus为cancelled的node
+        Node pred = node.prev;
+        // 向前查找到queue中第一个waitStatus不为cancelled的node，标记为pred
+        while (pred.waitStatus > 0)
+            node.prev = pred = pred.prev;
+
+        // predNext is the apparent node to unsplice. CASes below will
+        // fail if not, in which case, we lost race vs another cancel
+        // or signal, so no further action is necessary.
+        // predNext只会在后面的CAS中当做expect使用，这里拿到也仅为这一个目的
+        Node predNext = pred.next;
+
+        // Can use unconditional write instead of CAS here.
+        // After this atomic step, other Nodes can skip past us.
+        // Before, we are free of interference from other threads.
+        // 当waitStatus被置为CANCELLED后，后面的node向前查找时将跳过该node，而且在某些情况下将会把该node从queue中清除出去
+        node.waitStatus = Node.CANCELLED;
+
+        // If we are the tail, remove ourselves.
+        // node == tail时，清理
+        if (node == tail && compareAndSetTail(node, pred)) {
+            compareAndSetNext(pred, predNext, null);
+        } else {
+            // If successor needs signal, try to set pred's next-link
+            // so it will get one. Otherwise wake it up to propagate.
+            int ws;
+            if (pred != head &&
+                    // pred.waitStatus必须为SIGNAL状态
+                    ((ws = pred.waitStatus) == Node.SIGNAL ||
+                            // 如果pred.waitStatus为其他等待状态，也要用CAS将其状态置换为SIGNAL状态
+                            (ws <= 0 && compareAndSetWaitStatus(pred, ws, Node.SIGNAL))) &&
+                    pred.thread != null) {
+
+                // 将node从queue中移除
+                // pred -> node -> next 变为：
+                // pred -> next
+                Node next = node.next;
+                if (next != null && next.waitStatus <= 0)
+                    compareAndSetNext(pred, predNext, next);
+            } else {
+                unparkSuccessor(node);
+            }
+
+            node.next = node; // help GC
+        }
+    }
 }
