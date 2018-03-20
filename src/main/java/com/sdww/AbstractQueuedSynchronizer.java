@@ -311,4 +311,210 @@ public class AbstractQueuedSynchronizer {
             node.next = node; // help GC
         }
     }
+
+    /**
+     * Acquires in exclusive timed mode.
+     *
+     * @param arg the acquire argument
+     * @param nanosTimeout max wait time
+     * @return {@code true} if acquired
+     */
+    private boolean doAcquireNanos(int arg, long nanosTimeout)
+            throws InterruptedException {
+        if (nanosTimeout <= 0L)
+            return false;
+        final long deadline = System.nanoTime() + nanosTimeout;
+        final Node node = addWaiter(Node.EXCLUSIVE);
+        boolean failed = true;
+        try {
+            for (;;) {
+                final Node p = node.predecessor();
+                if (p == head && tryAcquire(arg)) {
+                    setHead(node);
+                    p.next = null; // help GC
+                    failed = false;
+                    return true;
+                }
+                nanosTimeout = deadline - System.nanoTime();
+                if (nanosTimeout <= 0L)
+                    return false;
+                if (shouldParkAfterFailedAcquire(p, node) &&
+                        nanosTimeout > spinForTimeoutThreshold)
+                    LockSupport.parkNanos(this, nanosTimeout);
+                if (Thread.interrupted())
+                    throw new InterruptedException();
+            }
+        } finally {
+            if (failed)
+                cancelAcquire(node);
+        }
+    }
+
+    /**
+     * Releases in exclusive mode.  Implemented by unblocking one or
+     * more threads if {@link #tryRelease} returns true.
+     * This method can be used to implement method {@link Lock#unlock}.
+     * 对于release来说就简单多了，只需要将head唤醒即可
+     *
+     * @param arg the release argument.  This value is conveyed to
+     *        {@link #tryRelease} but is otherwise uninterpreted and
+     *        can represent anything you like.
+     * @return the value returned from {@link #tryRelease}
+     */
+    public final boolean release(int arg) {
+        if (tryRelease(arg)) {
+            Node h = head;
+            if (h != null && h.waitStatus != 0)
+                unparkSuccessor(h);
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * Wakes up node's successor, if one exists.
+     *
+     * @param node the node
+     */
+    private void unparkSuccessor(Node node) {
+        /*
+         * If status is negative (i.e., possibly needing signal) try
+         * to clear in anticipation of signalling.  It is OK if this
+         * fails or if status is changed by waiting thread.
+         *
+         * ws < 0说明后一个节点的状态为等待：每一个node的status保存的都是后一个节点的等待状态
+         */
+        int ws = node.waitStatus;
+        if (ws < 0)
+            compareAndSetWaitStatus(node, ws, 0);
+
+        /*
+         * Thread to unpark is held in successor, which is normally
+         * just the next node.  But if cancelled or apparently null,
+         * traverse backwards from tail to find the actual
+         * non-cancelled successor.
+         *
+         * 从后往前清理为null以及waitStatus为cancelled的node
+         * s指向的是后续第一个不为cancelled状态node的thread
+         *
+         */
+        Node s = node.next;
+        if (s == null || s.waitStatus > 0) {
+            s = null;
+            for (Node t = tail; t != null && t != node; t = t.prev)
+                if (t.waitStatus <= 0)
+                    s = t;
+        }
+        if (s != null)
+            LockSupport.unpark(s.thread);
+    }
+
+    /**
+     * Attempts to acquire in shared mode. This method should query if
+     * the state of the object permits it to be acquired in the shared
+     * mode, and if so to acquire it.
+     *
+     * <p>This method is always invoked by the thread performing
+     * acquire.  If this method reports failure, the acquire method
+     * may queue the thread, if it is not already queued, until it is
+     * signalled by a release from some other thread.
+     *
+     * <p>The default implementation throws {@link
+     * UnsupportedOperationException}.
+     *
+     * @param arg the acquire argument. This value is always the one
+     *        passed to an acquire method, or is the value saved on entry
+     *        to a condition wait.  The value is otherwise uninterpreted
+     *        and can represent anything you like.
+     * @return a negative value on failure; zero if acquisition in shared
+     *         mode succeeded but no subsequent shared-mode acquire can
+     *         succeed; and a positive value if acquisition in shared
+     *         mode succeeded and subsequent shared-mode acquires might
+     *         also succeed, in which case a subsequent waiting thread
+     *         must check availability. (Support for three different
+     *         return values enables this method to be used in contexts
+     *         where acquires only sometimes act exclusively.)  Upon
+     *         success, this object has been acquired.
+     *
+     *         这里的返回值有三种：
+     *         1.小于0，说明请求失败
+     *         2.等于0，当前成功，后续将失败
+     *         3.大于0，当前及后续都将成功
+     * @throws IllegalMonitorStateException if acquiring would place this
+     *         synchronizer in an illegal state. This exception must be
+     *         thrown in a consistent fashion for synchronization to work
+     *         correctly.
+     * @throws UnsupportedOperationException if shared mode is not supported
+     */
+    protected int tryAcquireShared(int arg) {
+        throw new UnsupportedOperationException();
+    }
+
+    /**
+     * Acquires in shared uninterruptible mode.
+     * @param arg the acquire argument
+     */
+    private void doAcquireShared(int arg) {
+        final Node node = addWaiter(Node.SHARED);
+        boolean failed = true;
+        try {
+            boolean interrupted = false;
+            for (;;) {
+                final Node p = node.predecessor();
+                if (p == head) {
+                    int r = tryAcquireShared(arg);
+                    //当前获取成功了
+                    if (r >= 0) {
+                        setHeadAndPropagate(node, r);
+                        p.next = null; // help GC
+                        if (interrupted)
+                            selfInterrupt();
+                        failed = false;
+                        return;
+                    }
+                }
+                if (shouldParkAfterFailedAcquire(p, node) &&
+                        parkAndCheckInterrupt())
+                    interrupted = true;
+            }
+        } finally {
+            if (failed)
+                cancelAcquire(node);
+        }
+    }
+
+    /**
+     * Sets head of queue, and checks if successor may be waiting
+     * in shared mode, if so propagating if either propagate > 0 or
+     * PROPAGATE status was set.
+     *
+     * @param node the node
+     * @param propagate the return value from a tryAcquireShared
+     */
+    private void setHeadAndPropagate(Node node, int propagate) {
+        Node h = head; // Record old head for check below
+        setHead(node);
+        /*
+         * Try to signal next queued node if:
+         *   Propagation was indicated by caller,
+         *     or was recorded (as h.waitStatus either before
+         *     or after setHead) by a previous operation
+         *     (note: this uses sign-check of waitStatus because
+         *      PROPAGATE status may transition to SIGNAL.)
+         * and
+         *   The next node is waiting in shared mode,
+         *     or we don't know, because it appears null
+         *
+         * The conservatism in both of these checks may cause
+         * unnecessary wake-ups, but only when there are multiple
+         * racing acquires/releases, so most need signals now or soon
+         * anyway.
+         */
+        if (propagate > 0 || h == null || h.waitStatus < 0 ||
+                (h = head) == null || h.waitStatus < 0) {
+            Node s = node.next;
+            if (s == null || s.isShared())
+                doReleaseShared();
+        }
+    }
 }
